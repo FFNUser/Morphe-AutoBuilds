@@ -851,30 +851,38 @@ def plan_incremental(full_matrix: List[dict], old_manifest: Optional[dict],
                 reasons.append("patch-source-updated")
             # New app version detection for apps pinned to "latest" (no pinned
             # config version). When config_version is empty, the config_version
-            # compare above can never fire, so without this check a brand-new
-            # upstream release would be invisible to the planner and the stale
-            # APK would be carried forever.
+            # compare above can never fire.
             #
-            # The PRIMARY signal is the version the builder will actually ship:
-            # the highest isExperimental:false target in the patch set's
-            # patches-list (fetch_recommended_version). This mirrors the
-            # builder's `list-versions` selection exactly, so the planner can
-            # only ever flag a rebuild whose result would differ from the APK
-            # already shipped. We compare THAT against built_version.
+            # We ONLY flag a rebuild when the patches-list asset provides a
+            # concrete recommended version that is strictly newer than what was
+            # previously built.  This mirrors the builder's `list-versions`
+            # selection so the planner can only ever flag a rebuild whose result
+            # would actually differ from the APK already shipped.
             #
-            # If the recommended probe comes back empty (non-github source, no
-            # parseable patches-list asset, network error), we fall back to the
-            # store's newest published version so we still detect a new upstream
-            # app release instead of regressing to no-detection.
+            # IMPORTANT: If the recommended probe returns empty (which happens
+            # for ALL Morphe-ecosystem sources — they publish .mpp binaries, not
+            # .json patch-lists), we do NOT fall back to the store's latest
+            # version.  The store's latest is NOT what the builder ships; the
+            # builder ships whatever `java -jar cli list-versions` recommends,
+            # which is embedded in the .mpp and cannot be read without the CLI.
+            # Falling back to the store's latest caused every app to be
+            # needlessly rebuilt every day (e.g. store says YouTube 21.x,
+            # builder ships 20.51.x, planner sees 21 > 20 → rebuild → builder
+            # builds 20.51 again → infinite loop).
+            #
+            # When the patch repo publishes a genuinely new release that adds
+            # support for a newer app version, the SOURCE SIGNATURE changes
+            # (line 850-851 above), which already triggers the rebuild.
             if not cur_app_ver and old_built_ver:
                 target_ver = fetch_recommended_version(app, src)
-                probe_kind = "patch"
-                if not target_ver:
-                    target_ver = fetch_latest_app_version(app)
-                    probe_kind = "store"
                 if target_ver and _is_newer_version(target_ver, old_built_ver):
                     reasons.append(
-                        f"new-version: built {old_built_ver!r} -> {probe_kind} {target_ver!r}"
+                        f"new-version: built {old_built_ver!r} -> patch {target_ver!r}"
+                    )
+                elif not target_ver:
+                    logging.debug(
+                        f"  {app}/{src}: no patches-list JSON available; "
+                        f"relying on source-signature for rebuild detection"
                     )
             old_apk = carried_apk
             if old_apk and old_apk not in existing_apk_set:
