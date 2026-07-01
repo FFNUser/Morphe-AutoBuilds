@@ -1,0 +1,116 @@
+"""
+Lightweight Cloudflare Turnstile bypass using nodriver (undetected Chrome).
+
+Uses the system-installed Chrome binary (pre-installed on GitHub Actions
+ubuntu-latest runners), so there is NO extra browser download.
+
+Flow:
+  1. Detect a 403 "Just a moment..." response from APKMirror.
+  2. Spin up a headless Chrome via nodriver.
+  3. Let Cloudflare solve itself (Turnstile auto-clears for real browsers).
+  4. Grab cf_clearance + other cookies.
+  5. Inject them into the curl_cffi session for all subsequent requests.
+  6. Cache cookies so the browser only launches ONCE per run.
+"""
+import asyncio
+import logging
+
+# Module-level cookie cache: once solved, reuse for every request.
+_cf_cookie_cache: dict = {}
+_solve_attempted: bool = False
+
+
+async def _solve_challenge_async(url: str, timeout: int = 30) -> dict:
+    """Navigate to *url* in headless Chrome, wait for Cloudflare to clear,
+    and return a dict of cookies for the apkmirror.com domain."""
+    import nodriver as uc  # imported lazily so the dep is optional
+
+    cookies: dict = {}
+    browser = None
+    try:
+        browser = await uc.start(headless=True)
+        page = await browser.get(url)
+
+        # Poll until Cloudflare clears (title changes from "Just a moment...")
+        elapsed = 0
+        while elapsed < timeout:
+            await asyncio.sleep(0.5)
+            elapsed += 0.5
+            try:
+                title = await page.evaluate("document.title")
+            except Exception:
+                title = ""
+            if title and "Just a moment" not in title:
+                logging.info(f"Cloudflare cleared after {elapsed:.1f}s — title: {title}")
+                break
+        else:
+            logging.warning(f"Cloudflare did not clear within {timeout}s")
+
+        # Small extra wait for cookies to finalise
+        await asyncio.sleep(1)
+
+        # Extract cookies
+        raw = await browser.cookies.get_all()
+        for c in raw:
+            domain = getattr(c, "domain", "") or ""
+            name   = getattr(c, "name", "")   or ""
+            value  = getattr(c, "value", "")  or ""
+            if "apkmirror" in domain and name:
+                cookies[name] = value
+
+        if cookies:
+            logging.info(f"Extracted {len(cookies)} APKMirror cookie(s)")
+        else:
+            logging.warning("No APKMirror cookies found after challenge")
+    except Exception as e:
+        logging.warning(f"nodriver Cloudflare bypass error: {e}")
+    finally:
+        if browser:
+            try:
+                browser.stop()
+            except Exception:
+                pass
+    return cookies
+
+
+def solve_cloudflare(url: str, timeout: int = 30) -> dict:
+    """Synchronous entry-point.  Returns cached cookies on repeat calls."""
+    global _cf_cookie_cache, _solve_attempted
+
+    if _cf_cookie_cache:
+        return _cf_cookie_cache
+
+    if _solve_attempted:
+        # Already failed once this run; don't retry (saves time).
+        return {}
+
+    _solve_attempted = True
+
+    try:
+        loop = asyncio.new_event_loop()
+        _cf_cookie_cache = loop.run_until_complete(
+            _solve_challenge_async(url, timeout)
+        )
+        loop.close()
+    except Exception as e:
+        logging.warning(f"Cloudflare bypass failed: {e}")
+        _cf_cookie_cache = {}
+
+    return _cf_cookie_cache
+
+
+def is_cf_challenge(response) -> bool:
+    """Return True if the response is a Cloudflare Turnstile / JS challenge."""
+    if response.status_code != 403:
+        return False
+    # Header set by Cloudflare when it serves a managed challenge page
+    if response.headers.get("cf-mitigated") == "challenge":
+        return True
+    # Fallback: check body for the classic "Just a moment..." page
+    try:
+        snippet = response.text[:500] if hasattr(response, "text") else ""
+        if "Just a moment" in snippet:
+            return True
+    except Exception:
+        pass
+    return False
