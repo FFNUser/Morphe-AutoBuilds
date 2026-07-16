@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+import shutil
 import logging
 from typing import List, Optional
 from github.GithubException import BadCredentialsException
@@ -88,6 +89,11 @@ def find_file(files: list[Path], prefix: str = None, suffix: str = None, contain
     return None
 
 def find_apksigner() -> str | None:
+    # First, try to find apksigner in the system PATH
+    system_apksigner = shutil.which("apksigner")
+    if system_apksigner:
+        return system_apksigner
+
     sdk_root = Path("/usr/local/lib/android/sdk")
     build_tools_dir = sdk_root / "build-tools"
 
